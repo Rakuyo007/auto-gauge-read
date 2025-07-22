@@ -6,7 +6,7 @@ from PIL import Image
 from ocr import numbers_ocr
 import math
 
-def get_center_point(box):
+def get_center_point(box: list) -> tuple:
     """计算矩形框的中心点"""
     x1, y1, x2, y2 = box
     cx = (x1 + x2) / 2
@@ -20,7 +20,7 @@ def get_angle(x, y):
     """
     return (math.degrees(-math.atan2(-y, x)) + 270) % 360
 
-def interpolate_value(base_point_box: dict, confident_numbers: List[dict], confident_tip: dict) -> float:
+def interpolate_value(base_point_box: dict, confident_numbers: List[dict], confident_tip: dict, calibration_value: float) -> float:
     reference_points = []
     base_point = get_center_point(base_point_box)
     for confident_number in confident_numbers:
@@ -30,29 +30,60 @@ def interpolate_value(base_point_box: dict, confident_numbers: List[dict], confi
         cy -= base_point[1]
         reference_points.append({
             "coo": (cx, cy),
-            "angle": get_angle(cx, cy),
+            "angle_raw": get_angle(cx, cy),
+            "angle": get_angle(cx, cy) + calibration_value,
             "value": confident_number['ocr_result'][0]['content']
         })
         print("Reference Point:", reference_points[-1])
     tip_point_coo = get_center_point(confident_tip['bbox'])
-    tip_point_angle = get_angle(tip_point_coo[0] - base_point[0], tip_point_coo[1] - base_point[1])
-    print("Tip Point:", tip_point_angle)
-    left = max((pt for pt in reference_points if pt['angle'] <= tip_point_angle), key=lambda x: x['angle'], default=None)
-    right = min((pt for pt in reference_points if pt['angle'] >= tip_point_angle), key=lambda x: x['angle'], default=None)
+    tip_point_angle_calibrated = get_angle(tip_point_coo[0] - base_point[0], tip_point_coo[1] - base_point[1]) + calibration_value
+    print("Tip Point:", tip_point_angle_calibrated)
+    left = max((pt for pt in reference_points if pt['angle'] <= tip_point_angle_calibrated), key=lambda x: x['angle'], default=None)
+    right = min((pt for pt in reference_points if pt['angle'] >= tip_point_angle_calibrated), key=lambda x: x['angle'], default=None)
     if left and right and left['angle'] != right['angle']:
         aL, vL = left['angle'], float(left['value'])
         aR, vR = right['angle'], float(right['value'])
-        aT = tip_point_angle
+        aT = tip_point_angle_calibrated
         value_tip = vL + (vR - vL) * (aT - aL) / (aR - aL)
     else:
         value_tip = None  # 无法插值
 
     return value_tip
 
-if __name__ == '__main__':
-    image_path = "./test_imgs/3.jpg"
-    model = YOLO("/Users/well/Documents/PyCharmProjects/yolo-model-train/runs/meter2/weights/best.pt")
-    results = model.predict(source=image_path, show=False, save=True, imgsz=640, conf=0.3)
+def get_calibration(base_bbox: list, maximum_bbox: list, minimum_bbox: list) -> float:
+    """
+    计算角度校准值，假设 base_bbox 是基准点检测框，maximum_bbox 和 minimum_bbox 分别是最大值和最小值的检测框。
+    返回角度校准值。
+    """
+    if not base_bbox or not maximum_bbox or not minimum_bbox:
+        raise ValueError("Base, maximum, and minimum bounding boxes must be provided.")
+    if len(base_bbox) != 4 or len(maximum_bbox) != 4 or len(minimum_bbox) != 4:
+        raise ValueError("Bounding boxes must be in the format [x1, y1, x2, y2].")
+    # 解包边界框坐标
+    base_x1, base_y1, base_x2, base_y2 = base_bbox
+    max_x1, max_y1, max_x2, max_y2 = maximum_bbox
+    min_x1, min_y1, min_x2, min_y2 = minimum_bbox
+
+    # 计算基准点的中心坐标
+    base_cx, base_cy = get_center_point(base_bbox)
+
+    # 计算最大值和最小值的中心坐标
+    max_cx, max_cy = get_center_point(maximum_bbox)
+    min_cx, min_cy = get_center_point(minimum_bbox)
+
+    # 计算最大值和最小值坐标的中点坐标
+    mid_cx = (max_cx + min_cx) / 2
+    mid_cy = (max_cy + min_cy) / 2
+
+    # 计算校准值（示例：使用最大值和最小值的距离）
+    calibration_value = -get_angle(mid_cx - base_cx, mid_cy - base_cy)
+
+    return calibration_value
+
+
+def main_process(input_image_path: str, model_path: str):
+    model = YOLO(model_path)
+    results = model.predict(source=input_image_path, show=False, save=True, imgsz=640, conf=0.3)
     preds = []
     for result in results:
         boxes = result.boxes  # 检测框对象
@@ -68,11 +99,18 @@ if __name__ == '__main__':
                 "confidence": round(conf, 4)
             }
             if pred['name'] == 'number':
-                pil_image = Image.open(image_path).convert("RGB")
+                pil_image = Image.open(input_image_path).convert("RGB")
                 cropped_img = pil_image.crop((x1, y1, x2, y2))
                 ocr_result = numbers_ocr(cropped_img)
                 pred["ocr_result"] = ocr_result
             preds.append(pred)
+
+    calibration_value = get_calibration(
+        base_bbox=next((pred['bbox'] for pred in preds if pred['name'] == 'base'), None),
+        maximum_bbox=next((pred['bbox'] for pred in preds if pred['name'] == 'maximum'), None),
+        minimum_bbox=next((pred['bbox'] for pred in preds if pred['name'] == 'minimum'), None)
+    )
+    print("Calibration Value:", calibration_value)
     confident_numbers = []
     for pred in preds:
         print(pred)
@@ -85,5 +123,11 @@ if __name__ == '__main__':
     if confident_numbers and confidnet_tip:
         print("Confident Numbers:", confident_numbers)
         print("Confident Tip:", confidnet_tip)
-        result = interpolate_value(base_point['bbox'], confident_numbers, confidnet_tip)
+        result = interpolate_value(base_point['bbox'], confident_numbers, confidnet_tip, calibration_value)
         print("Interpolated Value:", result)
+
+
+if __name__ == '__main__':
+    input_image_path = "./test_imgs/2.jpg"
+    model_path = "/Users/well/Documents/PyCharmProjects/auto-gauge-read/best.pt"
+    main_process(input_image_path, model_path)
